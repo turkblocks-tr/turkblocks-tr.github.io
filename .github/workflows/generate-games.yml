@@ -1,0 +1,159 @@
+name: Generate Games JSON
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "*.html"
+      - "data/photo/**"
+      - ".github/workflows/generate-games.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: generate-games
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Depoyu indir
+        uses: actions/checkout@v4
+
+      - name: Python hazırla
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: games.json oluştur
+        run: |
+          python <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          from html.parser import HTMLParser
+
+          ROOT = Path(".")
+          OUTPUT = ROOT / "games.json"
+
+          EXCLUDED = {
+              "index.html",
+              "404.html",
+          }
+
+          class PageParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.title_depth = 0
+                  self.title_parts = []
+                  self.description = ""
+                  self.image = ""
+                  self.in_description = False
+
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+
+                  if tag == "title":
+                      self.title_depth += 1
+
+                  if tag == "meta":
+                      name = attrs.get("name", "").lower()
+                      prop = attrs.get("property", "").lower()
+                      content = attrs.get("content", "").strip()
+
+                      if name == "description" and content:
+                          self.description = content
+
+                      if prop == "og:title" and content and not self.title_parts:
+                          self.title_parts = [content]
+
+                      if prop == "og:image" and content:
+                          self.image = content
+
+              def handle_endtag(self, tag):
+                  if tag == "title" and self.title_depth:
+                      self.title_depth -= 1
+
+              def handle_data(self, data):
+                  if self.title_depth and data.strip():
+                      self.title_parts.append(data.strip())
+
+          games = []
+
+          for path in sorted(ROOT.glob("*.html")):
+              if path.name.lower() in EXCLUDED:
+                  continue
+
+              # Dosya adından oyun kimliği oluştur.
+              slug = path.stem
+
+              if not re.fullmatch(r"[A-Za-z0-9_-]+", slug):
+                  print(f"ATLANDI: Geçersiz dosya adı: {path.name}")
+                  continue
+
+              try:
+                  html = path.read_text(encoding="utf-8")
+              except (OSError, UnicodeError) as error:
+                  print(f"UYARI: {path.name} okunamadı: {error}")
+                  continue
+
+              parser = PageParser()
+
+              try:
+                  parser.feed(html)
+              except Exception as error:
+                  print(f"UYARI: {path.name} çözümlenemedi: {error}")
+                  continue
+
+              name = " ".join(parser.title_parts).strip()
+
+              if not name:
+                  name = slug.replace("-", " ").replace("_", " ").strip().title()
+
+              # Site genelindeki başlık ekini kaldır.
+              name = re.sub(
+                  r"\s*[-|]\s*TürkBlocks\s*$",
+                  "",
+                  name,
+                  flags=re.IGNORECASE
+              ).strip()
+
+              game = {
+                  "name": name,
+                  "slug": slug,
+                  "description": parser.description or f"{name} oyununu oyna."
+              }
+
+              if parser.image.startswith(("https://", "/")):
+                  game["image"] = parser.image
+
+              games.append(game)
+              print(f"EKLENDİ: {name} ({path.name})")
+
+          OUTPUT.write_text(
+              json.dumps(games, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8"
+          )
+
+          print(f"\nTamamlandı: {len(games)} oyun games.json dosyasına yazıldı.")
+          PY
+
+      - name: Değişiklikleri depoya kaydet
+        run: |
+          git add games.json
+
+          if git diff --cached --quiet; then
+            echo "games.json değişmedi; commit gerekmiyor."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "chore: otomatik games.json güncellemesi"
+          git push
